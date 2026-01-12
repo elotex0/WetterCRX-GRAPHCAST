@@ -184,11 +184,11 @@ jobs:
       - name: Upload current run and metadata.json to R2
         run: |
           aws s3 sync ./graphcast/${{ needs.fetch_and_generate.outputs.run }}/ \
-            s3://${{ secrets.R2_BUCKET }}/gfs/${{ needs.fetch_and_generate.outputs.run }}/ \
+            s3://${{ secrets.R2_BUCKET }}/graphcast/${{ needs.fetch_and_generate.outputs.run }}/ \
             --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
 
-          aws s3 cp ./gfs/metadata.json \
-            s3://${{ secrets.R2_BUCKET }}/gfs/metadata.json \
+          aws s3 cp ./graphcast/metadata.json \
+            s3://${{ secrets.R2_BUCKET }}/graphcast/metadata.json \
             --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
