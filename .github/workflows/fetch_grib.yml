@@ -1,0 +1,191 @@
+name: Fetch GRAPHCAST GRIB2 and Generate PNGs
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # -------------------------------------------------------
+  # 1️⃣ Fetch all GRIB2 data
+  # -------------------------------------------------------
+  fetch_and_generate:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.set_run_date.outputs.run }}
+      date: ${{ steps.set_run_date.outputs.date }}
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GRAPH_PAT }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set RUN and DATE
+        id: set_run_date
+        run: |
+          HOUR=$(date -u +%H)
+          case $HOUR in
+            07|08|09) RUN=00 ;;
+            13|14|15) RUN=06 ;;
+            19|20|21) RUN=12 ;;
+            01|02|03) RUN=18 ;;
+          esac
+          DATE=$(date -u +%Y%m%d)
+          echo "RUN=$RUN" >> $GITHUB_ENV
+          echo "DATE=$DATE" >> $GITHUB_ENV
+          echo "run=$RUN" >> $GITHUB_OUTPUT
+          echo "date=$DATE" >> $GITHUB_OUTPUT
+
+      - name: Download GRAPHCAST GRIB2 data via Python filters
+        run: |
+          export DATE=${{ env.DATE }}
+          export RUN=${{ env.RUN }}
+      
+          echo "🔹 Starte Python-Downloads für GRAPHCAST (DATE=$DATE, RUN=$RUN)"
+          python downloads/t2m.py &
+          python downloads/geo.py &
+          python downloads/pmsl.py &
+          wait
+      
+          echo "✅ Alle Variablen wurden erfolgreich geladen!"
+
+
+      - name: Upload GRIB2 as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grib2
+          path: data/
+
+      - name: Delete GRIB2 files (local cleanup)
+        run: rm -rf data/
+
+  # -------------------------------------------------------
+  # 2️⃣ Generate PNGs in parallel (matrix)
+  # -------------------------------------------------------
+  generate_pngs:
+    runs-on: ubuntu-latest
+    needs: fetch_and_generate
+    strategy:
+      matrix:
+        variable: [t2m, t2m_eu, pmsl, pmsl_eu, geo, geo_eu]
+      max-parallel: 6
+      
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download GRIB2 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: grib2
+          path: data/
+
+      - name: Generate PNGs for ${{ matrix.variable }}
+        run: |
+          mkdir -p graphcast/${{ matrix.variable }}
+          input_dir="data/${{ matrix.variable }}"
+          if [ "${{ matrix.variable }}" = "t2m_eu" ]; then
+            input_dir="data/t2m"
+          elif [ "${{ matrix.variable }}" = "pmsl_eu" ]; then
+            input_dir="data/pmsl"
+          elif [ "${{ matrix.variable }}" = "geo_eu" ]; then
+            input_dir="data/geo"
+          fi
+          python scripts/generate_pngs.py \
+            "$input_dir" \
+            "graphcast/${{ matrix.variable }}" \
+            "${{ matrix.variable }}"
+
+
+      - name: Upload PNGs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: graphcast-${{ matrix.variable }}
+          path: graphcast/${{ matrix.variable }}
+
+  # -------------------------------------------------------
+  # 3️⃣ Merge PNGs + Deploy to R2
+  # -------------------------------------------------------
+  deploy_to_r2:
+    runs-on: ubuntu-latest
+    needs: [fetch_and_generate, generate_pngs]
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v3
+
+      - name: Download all PNG artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: graphcast-*
+          path: graphcast_raw
+
+      - name: Merge PNG folders into one structure
+        run: |
+          mkdir -p graphcast/${{ needs.fetch_and_generate.outputs.run }}
+          for d in graphcast_raw/*; do
+            if [ -d "$d" ]; then
+              varname=$(basename "$d" | sed 's/^graphcast-//')  # entfernt "graphcast-" Prefix
+              mkdir -p graphcast/${{ needs.fetch_and_generate.outputs.run }}/"$varname"
+              cp -r "$d"/* graphcast/${{ needs.fetch_and_generate.outputs.run }}/"$varname"/ || true
+            fi
+          done
+
+
+          echo "Merged structure:"
+          ls -R graphcast/${{ needs.fetch_and_generate.outputs.run }}
+
+      - name: Generate Metadata
+        run: |
+          python scripts/generate_metadata.py \
+            graphcast/${{ needs.fetch_and_generate.outputs.run }} \
+            ${{ needs.fetch_and_generate.outputs.run }} \
+            ${{ needs.fetch_and_generate.outputs.date }}
+
+      - name: Clean old runs on R2 except current
+        run: |
+          for run_folder in $(aws s3 ls s3://${{ secrets.R2_BUCKET }}/graphcast/ \
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com | awk '{print $2}' | sed 's#/##'); do
+            if [ "$run_folder" != "${{ needs.fetch_and_generate.outputs.run }}/" ]; then
+              aws s3 rm s3://${{ secrets.R2_BUCKET }}/graphcast/$run_folder --recursive \
+                --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+            fi
+          done
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+
+      - name: Upload current run and metadata.json to R2
+        run: |
+          aws s3 sync ./graphcast/${{ needs.fetch_and_generate.outputs.run }}/ \
+            s3://${{ secrets.R2_BUCKET }}/gfs/${{ needs.fetch_and_generate.outputs.run }}/ \
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+
+          aws s3 cp ./gfs/metadata.json \
+            s3://${{ secrets.R2_BUCKET }}/gfs/metadata.json \
+            --endpoint-url https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
