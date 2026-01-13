@@ -49,7 +49,6 @@ jobs:
           if [ "$RUN" = "18" ]; then
             DATE=$(date -u -d "yesterday" +%Y%m%d)
           fi
-          DATE=$(date -u +%Y%m%d)
           echo "RUN=$RUN" >> $GITHUB_ENV
           echo "DATE=$DATE" >> $GITHUB_ENV
           echo "run=$RUN" >> $GITHUB_OUTPUT
